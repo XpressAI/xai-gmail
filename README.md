@@ -1,17 +1,17 @@
-# Xircuits Component Library Template
+# Xircuits Component Library For GMail
 
-This section should have a short description on what is does.
+Components for working with Gmail.
 
 ## Prerequisites
 
-A project may have prerequisites such as models that needs to be downloaded or non-python related setup. You may list them down here.
+Follow the steps at https://ai.google.dev/palm_docs/oauth_quickstart to create the required secrets file for authentication.
 
 ## Installation
 
 To use this component library, ensure you have Xircuits installed, then simply run:
 
 ```
-xircuits install https://github.com/your-organization/your-repository
+xircuits install https://github.com/XpressAI/xai-gmail
 ```
 
 Alternatively you may manually copy the directory / clone or submodule the repository to your working Xircuits project directory then install the packages using:
@@ -19,6 +19,3 @@ Alternatively you may manually copy the directory / clone or submodule the repos
 ```
 pip install -r requirements.txt
 ```
-
-## Tests
-A github action to test your workflow runs has been provided. Simply add the path of your workflows [here](.github/workflows/run-workflow-tests.yml#L11).
