@@ -1,0 +1,302 @@
+import base64
+import json
+import os
+import pickle
+import re
+
+from xai_components.base import InArg, OutArg, InCompArg, Component, BaseComponent, xai_component
+
+from googleapiclient.discovery import build
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+from google import pubsub_v1
+
+from email.message import EmailMessage
+
+from googleapiclient.errors import HttpError
+
+
+# If modifying these SCOPES, delete the file token.pickle.
+READONLY_SCOPE = ['https://www.googleapis.com/auth/gmail.readonly']
+READWRITE_SCOPE = ['https://www.googleapis.com/auth/gmail.modify']
+
+@xai_component
+class GmailAuthenticate(Component):
+    is_readwrite: InCompArg[bool]
+    token_path: InArg[str]
+    client_secret_path: InArg[str]
+    labels: OutArg[list]
+    
+    def execute(self, ctx) -> None:
+        creds = None
+        token_path = if self.token_path.value is not None then self.token_path.value else 'token.pickle'
+
+        if os.path.exists('token.pickle'):
+            with open(token_path, 'rb') as token:
+                creds = pickle.load(token)
+        
+        if not creds or not creds.valid:
+            if creds and creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+            else:
+                secret_path = if self.client_secret_path.value is not None self.client_secret_path.value else '/data/home/google_oauth_token.json'
+                scopes = READWRITE_SCOPE if self.is_readwrite.value else READONLY_SCOPE
+                flow = InstalledAppFlow.from_client_secrets_file(secret_path, scopes)
+                creds = flow.run_local_server(port=0)
+            
+            with open(token_path, 'wb') as token:
+                pickle.dump(creds, token)
+                
+        service = build('gmail', 'v1', credentials=creds)
+        ctx['gmail_service'] = service
+        
+        results = service.users().labels().list(userId='me').execute()
+        labels = results.get('labels', [])
+        ctx['gmail_labels'] = labels
+        
+        self.labels.value = labels
+
+@xai_component
+class PrintFormatted(Component):
+    fmt: InArg[str]
+    args: InArg[dict]
+    
+    def execute(self, ctx) -> None:
+        print(self.fmt.value.format(**self.args.value))
+        
+
+@xai_component
+class GmailCreateDraft(Component):
+    message_from: InCompArg[str]
+    message_to: InCompArg[str]
+    subject: InCompArg[str]
+    body: InCompArg[str]
+    
+    draft: OutArg[any]
+    
+    
+    def execute(self, ctx) -> None:
+        # create gmail api client
+        service = ctx['gmail_service']
+
+        message = EmailMessage()
+
+        message.set_content(self.body.value)
+
+        message['To'] = self.message_to.value
+        message['From'] = self.message_from.value
+        message['Subject'] = self.subject.value
+
+        # encoded message
+        encoded_message = base64.urlsafe_b64encode(message.as_bytes()).decode()
+
+        create_message = {
+            'message': {
+                'raw': encoded_message
+            }
+        }
+
+        draft = service.users().drafts().create(userId="me", body=create_message).execute()
+        self.draft.value = draft
+
+
+@xai_component
+class GmailListMessages(Component):
+    label: InCompArg[str]
+    messages: OutArg[list]
+    next_page_token: OutArg[str]
+    result_size_estimate: OutArg[int]
+    
+    
+    def execute(self, ctx) -> None:
+        # create gmail api client
+        service = ctx['gmail_service']
+
+        messages = service.users().messages().list(userId="me").execute()
+        
+        self.messages.value = messages['messages']
+        self.next_page_token = messages['nextPageToken']
+        self.result_size_estimate = messages['resultSizeEstimate']
+
+
+@xai_component
+class GmailGetMessage(Component):
+    message_ref: InCompArg[dict]
+    message: OutArg[dict]
+    message_text: OutArg[str]
+    
+    
+    def execute(self, ctx) -> None:
+        # create gmail api client
+        service = ctx['gmail_service']
+
+        message = service.users().messages().get(userId="me", id=self.message_ref.value['id']).execute()
+        
+        self.message.value = message
+        try:
+            parts = message['payload']['parts']
+            for part in parts:
+                if part['mimeType'] == 'text/plain':
+                    charset = 'UTF-8'
+                    for header in part['headers']:
+                        if header['name'] == 'Content-Type':
+                            charset_pattern = r'charset[=]["\']?(.+?)["\']?$'
+                            match = re.search(charset_pattern, header['value'])
+                            if match:
+                                charset = match.group(1)
+                    self.message_text.value = base64.urlsafe_b64decode(part['body']['data']).decode(charset)
+        except Exception as e:
+            print(e)
+            self.message_text.value = None
+
+
+@xai_component
+class GmailOnReceiveMessage(Component):
+    on_message: BaseComponent
+    
+    target_label: InCompArg[str]
+    topic_name: InCompArg[str]
+    subscription_name: InCompArg[str]
+    project_name: InCompArg[str]
+    
+    message: OutArg[dict]
+    message_text: OutArg[str]
+    
+    
+    def execute(self, ctx) -> None:
+        # create gmail api client
+        service = ctx['gmail_service']
+
+        request = {
+          'labelIds': [self.target_label.value],
+          'topicName': self.topic_name.value
+        }
+        service.users().watch(userId='me', body=request).execute()
+        
+        import google
+        from google.auth.transport.requests import Request
+
+        creds, project = google.auth.default()
+
+        if creds.expired and creds.refresh_token:
+            print("Refreshing token")
+            creds.refresh(Request())
+        else:
+            print("Credentials not expired")
+        
+        from google.auth.credentials import with_scopes_if_required
+
+        subscriber = pubsub_v1.SubscriberClient(credentials=with_scopes_if_required(creds))
+        #subscriber = pubsub_v1.SubscriberClient()
+        subscription_path = subscriber.subscription_path(
+            self.project_name.value,
+            self.subscription_name.value
+        )
+        
+        #try:
+        while True:
+            response = subscriber.pull({
+                'subscription': subscription_path,
+                'max_messages': 10
+            })
+            print(f"got messages.  Count ({len(response.received_messages)})")
+
+            for msg in response.received_messages:
+                data = json.loads(msg.message.data.decode('UTF-8'))
+                
+                request = pubsub_v1.AcknowledgeRequest(
+                    subscription=subscription_path,
+                    ack_ids=[msg.ack_id],
+                )
+                ack_result = subscriber.acknowledge(request=request)
+
+                history = service.users().history().list(userId='me', startHistoryId=data['historyId']).execute()
+                print("history")
+                print(history)
+                changes = history['history'] if 'history' in history else []
+                print("changes")
+                print(changes)
+                
+                for change in changes:
+                    for message in change.get('messages', []):
+                        msg = service.users().messages().get(userId='me', id=message['id']).execute()
+                        print(msg)
+                        self.message.value = msg
+                        parts = msg['payload']['parts']
+                        for part in parts:
+                            if part['mimeType'] == 'text/plain':
+                                charset = 'UTF-8'
+                                for header in part['headers']:
+                                    if header['name'] == 'Content-Type':
+                                        charset_pattern = r'charset[=]["\']?(.+?)["\']?$'
+                                        match = re.search(charset_pattern, header['value'])
+                                        if match:
+                                            charset = match.group(1)
+                                self.message_text.value = base64.urlsafe_b64decode(part['body']['data']).decode(charset)
+                                next_body = self.on_message.do(ctx)
+                                while next_body:
+                                    next_body = next_body.do(ctx)
+                                break
+        #except Exception as e:
+        #    print(e)
+
+
+@xai_component
+class GmailSearchMessages(Component):
+    query: InCompArg[str]
+    messages: OutArg[list]
+    
+    def execute(self, ctx) -> None:
+        # create gmail api client
+        service = ctx['gmail_service']
+
+        try:
+            results = service.users().messages().list(userId='me', q=self.query.value).execute()
+            self.messages.value = results.get('messages', [])
+        except HttpError as error:
+            print(f'An error occurred: {error}')
+            self.messages.value = []
+
+
+@xai_component
+class GmailCreateReply(Component):
+    message_id: InCompArg[str]
+    reply_body: InCompArg[str]
+    draft: OutArg[any]
+    
+    def execute(self, ctx) -> None:
+        # create gmail api client
+        service = ctx['gmail_service']
+
+        try:
+            # Get the original message to reply to
+            original_message = service.users().messages().get(userId='me', id=self.message_id.value).execute()
+            original_sender = None
+            
+            # Extract the sender's email address
+            if 'payload' in original_message and 'headers' in original_message['payload']:
+                for header in original_message['payload']['headers']:
+                    if header['name'] == 'From':
+                        original_sender = header['value']
+                        break
+            
+            # Create the reply message
+            message = EmailMessage()
+            message.set_content(self.reply_body.value)
+            message['To'] = original_sender
+            message['Subject'] = f"Re: {original_message['snippet']}"  # Use snippet for the original subject
+            
+            # Encode message
+            encoded_message = base64.urlsafe_b64encode(message.as_bytes()).decode()
+            create_message = {
+                'message': {
+                    'raw': encoded_message
+                }
+            }
+
+            # Create draft
+            draft = service.users().drafts().create(userId="me", body=create_message).execute()
+            self.draft.value = draft
+        except HttpError as error:
+            print(f'An error occurred: {error}')
+            self.draft.value = None
