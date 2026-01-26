@@ -4,7 +4,7 @@ Components for working with Gmail.
 
 ## Prerequisites
 
-Follow the steps at https://ai.google.dev/palm_docs/oauth_quickstart to create the required secrets file for authentication.
+Follow the steps at [https://ai.google.dev/palm_docs/oauth_quickstart](https://developers.google.com/identity/protocols/oauth2) to create the required secrets file for authentication.
 
 ## Installation
 
